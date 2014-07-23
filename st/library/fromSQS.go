@@ -4,15 +4,17 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"fmt"
-	"github.com/mikedewar/aws4"
-	"github.com/nytlabs/streamtools/st/blocks" // blocks
-	"github.com/nytlabs/streamtools/st/util"
 	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
-	"strings"
+
+	"github.com/mikedewar/aws4"
+	"github.com/nytlabs/streamtools/st/blocks" // blocks
+	"github.com/nytlabs/streamtools/st/util"
+	//"reflect"
+	//"strings"
 	"sync"
 	"time"
 )
@@ -27,6 +29,7 @@ func dialTimeout(network, addr string) (net.Conn, error) {
 }
 
 func (b *FromSQS) listener() {
+	log.Println("Starting new SQS listener")
 	b.lock.Lock()
 	lAuth := map[string]string{}
 	var err error
@@ -55,6 +58,12 @@ func (b *FromSQS) listener() {
 
 	sqsclient := &aws4.Client{Keys: keys, Client: httpclient}
 
+	parsedUrl, err := url.Parse(lAuth["SQSEndpoint"])
+	if err != nil {
+		b.Error(err)
+		return
+	}
+
 	query := url.Values{}
 	query.Set("Action", "ReceiveMessage")
 	query.Set("AttributeName", "All")
@@ -62,7 +71,12 @@ func (b *FromSQS) listener() {
 	query.Set("SignatureVersion", lAuth["SignatureVersion"])
 	query.Set("WaitTimeSeconds", lAuth["WaitTimeSeconds"])
 	query.Set("MaxNumberOfMessages", lAuth["MaxNumberOfMessages"])
-	queryurl := lAuth["SQSEndpoint"] + query.Encode()
+
+	parsedUrl.RawQuery = query.Encode()
+
+	queryurl := parsedUrl.String()
+
+	log.Println("Starting SQS read loop")
 
 	for {
 		select {
@@ -71,16 +85,20 @@ func (b *FromSQS) listener() {
 			return
 		default:
 			var m sqsMessage
-			var m1 map[string]interface{}
 
 			resp, err := sqsclient.Get(queryurl)
 
 			if err != nil {
+				b.Error("could not connect to SQS endpoint. waiting 1s")
+				b.Error(err)
+				time.Sleep(1 * time.Second)
 				continue
 			}
 
 			body, err := ioutil.ReadAll(resp.Body)
 			if err != nil {
+				b.Error("could not read Body")
+				b.Error(err)
 				continue
 			}
 
@@ -88,54 +106,53 @@ func (b *FromSQS) listener() {
 
 			err = xml.Unmarshal(body, &m)
 			if err != nil {
+				b.Error("could not unmarshal XML")
+				b.Error(err)
 				continue
 			}
 
 			if len(m.Body) == 0 {
+				// no messages on queue
+				b.Error("no messages on queue. waiting 1s")
+				time.Sleep(1 * time.Second)
 				continue
 			}
 
 			for _, body := range m.Body {
-				err = json.Unmarshal([]byte(body), &m1)
-				if err != nil {
+				select {
+				case b.fromListener <- []byte(body):
+				default:
+					log.Println("discarding messages")
+					log.Println(len(b.fromListener))
 					continue
 				}
-				msgString, ok := m1["Message"].(string)
-				if !ok {
-					continue
-				}
-				msgs := strings.Split(msgString, "\n")
-				for _, msg := range msgs {
-					if len(msg) == 0 {
-						continue
-					}
+			}
 
-					go func(outmsg string) {
-						stop := time.NewTimer(1 * time.Second)
-						select {
-						case b.fromListener <- []byte(outmsg):
-						case <-stop.C:
-							return
-						}
-					}(msg)
-
-				}
+			parsedUrl, err := url.Parse(lAuth["SQSEndpoint"])
+			if err != nil {
+				b.Error(err)
+				continue
 			}
 
 			delquery := url.Values{}
 			delquery.Set("Action", "DeleteMessageBatch")
 			delquery.Set("Version", lAuth["APIVersion"])
 			delquery.Set("SignatureVersion", lAuth["SignatureVersion"])
+
 			for i, r := range m.ReceiptHandle {
 				id := fmt.Sprintf("DeleteMessageBatchRequestEntry.%d.Id", (i + 1))
 				receipt := fmt.Sprintf("DeleteMessageBatchRequestEntry.%d.ReceiptHandle", (i + 1))
 				delquery.Add(id, fmt.Sprintf("msg%d", (i+1)))
 				delquery.Add(receipt, r)
 			}
-			delurl := lAuth["SQSEndpoint"] + delquery.Encode()
+			parsedUrl.RawQuery = delquery.Encode()
+			delurl := parsedUrl.String()
 
 			resp, err = sqsclient.Get(delurl)
 			if err != nil {
+				b.Error("could not delete messages. waiting 1s")
+				b.Error(err)
+				time.Sleep(1 * time.Second)
 				continue
 			}
 
@@ -147,10 +164,10 @@ func (b *FromSQS) listener() {
 // specify those channels we're going to use to communicate with streamtools
 type FromSQS struct {
 	blocks.Block
-	queryrule chan chan interface{}
-	inrule    chan interface{}
-	out       chan interface{}
-	quit      chan interface{}
+	queryrule chan blocks.MsgChan
+	inrule    blocks.MsgChan
+	out       blocks.MsgChan
+	quit      blocks.MsgChan
 
 	lock         sync.Mutex
 	listening    bool
@@ -166,12 +183,13 @@ func NewFromSQS() blocks.BlockInterface {
 
 // Setup is called once before running the block. We build up the channels and specify what kind of block this is.
 func (b *FromSQS) Setup() {
-	b.Kind = "fromSQS"
+	b.Kind = "Queues"
+	b.Desc = "reads from Amazon's SQS, emitting each line of JSON as a separate message"
 	b.inrule = b.InRoute("rule")
 	b.queryrule = b.QueryRoute("rule")
 	b.quit = b.Quit()
 	b.out = b.Broadcast()
-	b.fromListener = make(chan []byte)
+	b.fromListener = make(chan []byte, 1000)
 	b.stop = make(chan bool)
 	b.auth = map[string]interface{}{
 		"SQSEndpoint":         "",
@@ -185,6 +203,7 @@ func (b *FromSQS) Setup() {
 }
 
 func (b *FromSQS) stopListening() {
+	log.Println("attempting to stop SQS reader")
 	if b.listening {
 		b.stop <- true
 		b.listening = false
@@ -219,9 +238,9 @@ func (b *FromSQS) Run() {
 				continue
 			}
 			b.out <- outMsg
-		case respChan := <-b.queryrule:
+		case MsgChan := <-b.queryrule:
 			// deal with a query request
-			respChan <- b.auth
+			MsgChan <- b.auth
 		}
 	}
 }

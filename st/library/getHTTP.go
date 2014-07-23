@@ -3,21 +3,22 @@ package library
 import (
 	"encoding/json"
 	"errors"
+	"io/ioutil"
+	"net/http"
+
 	"github.com/nytlabs/gojee"                 // jee
 	"github.com/nytlabs/streamtools/st/blocks" // blocks
 	"github.com/nytlabs/streamtools/st/util"
-	"io/ioutil"
-	"net/http"
 )
 
 // specify those channels we're going to use to communicate with streamtools
 type GetHTTP struct {
 	blocks.Block
-	queryrule chan chan interface{}
-	inrule    chan interface{}
-	in        chan interface{}
-	out       chan interface{}
-	quit      chan interface{}
+	queryrule chan blocks.MsgChan
+	inrule    blocks.MsgChan
+	in        blocks.MsgChan
+	out       blocks.MsgChan
+	quit      blocks.MsgChan
 }
 
 // we need to build a simple factory so that streamtools can make new blocks of this kind
@@ -27,7 +28,8 @@ func NewGetHTTP() blocks.BlockInterface {
 
 // Setup is called once before running the block. We build up the channels and specify what kind of block this is.
 func (b *GetHTTP) Setup() {
-	b.Kind = "GetHTTP"
+	b.Kind = "Network I/O"
+	b.Desc = "makes an HTTP GET request to a URL you specify in the inbound message"
 	b.in = b.InRoute("in")
 	b.inrule = b.InRoute("rule")
 	b.queryrule = b.QueryRoute("rule")
@@ -92,15 +94,19 @@ func (b *GetHTTP) Run() {
 				continue
 			}
 			var outMsg interface{}
+			// try treating the body as json first...
 			err = json.Unmarshal(body, &outMsg)
+
+			// if the json parsing fails, store data unparsed as "data"
 			if err != nil {
-				b.Error(err)
-				continue
+				outMsg = map[string]interface{}{
+					"data": string(body),
+				}
 			}
 			b.out <- outMsg
-		case respChan := <-b.queryrule:
+		case MsgChan := <-b.queryrule:
 			// deal with a query request
-			respChan <- map[string]interface{}{
+			MsgChan <- map[string]interface{}{
 				"Path": path,
 			}
 

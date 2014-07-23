@@ -2,6 +2,7 @@ package library
 
 import (
 	"encoding/json"
+
 	"github.com/bitly/go-nsq"
 	"github.com/nytlabs/streamtools/st/blocks" // blocks
 	"github.com/nytlabs/streamtools/st/util"
@@ -10,13 +11,11 @@ import (
 // specify those channels we're going to use to communicate with streamtools
 type ToNSQ struct {
 	blocks.Block
-	queryrule    chan chan interface{}
-	inrule       chan interface{}
-	in           chan interface{}
-	out          chan interface{}
-	quit         chan interface{}
-	nsqdTCPAddrs string
-	topic        string
+	queryrule chan blocks.MsgChan
+	inrule    blocks.MsgChan
+	in        blocks.MsgChan
+	out       blocks.MsgChan
+	quit      blocks.MsgChan
 }
 
 // a bit of boilerplate for streamtools
@@ -25,7 +24,8 @@ func NewToNSQ() blocks.BlockInterface {
 }
 
 func (b *ToNSQ) Setup() {
-	b.Kind = "ToNSQ"
+	b.Kind = "Queues"
+	b.Desc = "send messages to an NSQ topic"
 	b.in = b.InRoute("in")
 	b.inrule = b.InRoute("rule")
 	b.queryrule = b.QueryRoute("rule")
@@ -34,20 +34,23 @@ func (b *ToNSQ) Setup() {
 
 // connects to an NSQ topic and emits each message into streamtools.
 func (b *ToNSQ) Run() {
-	var writer *nsq.Writer
+	var err error
+	var nsqdTCPAddrs string
+	var topic string
+	var writer *nsq.Producer
+
+	conf := nsq.NewConfig()
 
 	for {
 		select {
 		case ruleI := <-b.inrule:
-			//rule := ruleI.(map[string]interface{})
-
-			topic, err := util.ParseString(ruleI, "Topic")
+			topic, err = util.ParseString(ruleI, "Topic")
 			if err != nil {
 				b.Error(err)
 				break
 			}
 
-			nsqdTCPAddrs, err := util.ParseString(ruleI, "NsqdTCPAddrs")
+			nsqdTCPAddrs, err = util.ParseString(ruleI, "NsqdTCPAddrs")
 			if err != nil {
 				b.Error(err)
 				break
@@ -57,19 +60,28 @@ func (b *ToNSQ) Run() {
 				writer.Stop()
 			}
 
-			writer = nsq.NewWriter(nsqdTCPAddrs)
-
-			b.topic = topic
-			b.nsqdTCPAddrs = nsqdTCPAddrs
+			writer, err = nsq.NewProducer(nsqdTCPAddrs, conf)
+			if err != nil {
+				b.Error(err)
+				break
+			}
 
 		case msg := <-b.in:
-			msgStr, err := json.Marshal(msg)
-			if err != nil {
-				b.Error(err)
+			if writer == nil {
+				continue
 			}
-			_, _, err = writer.Publish(b.topic, []byte(msgStr))
+			msgBytes, err := json.Marshal(msg)
 			if err != nil {
 				b.Error(err)
+				break
+			}
+			if len(msgBytes) == 0 {
+				continue
+			}
+			err = writer.Publish(topic, msgBytes)
+			if err != nil {
+				b.Error(err)
+				break
 			}
 
 		case <-b.quit:
@@ -79,8 +91,8 @@ func (b *ToNSQ) Run() {
 			return
 		case c := <-b.queryrule:
 			c <- map[string]interface{}{
-				"Topic":        b.topic,
-				"NsqdTCPAddrs": b.nsqdTCPAddrs,
+				"Topic":        topic,
+				"NsqdTCPAddrs": nsqdTCPAddrs,
 			}
 		}
 	}

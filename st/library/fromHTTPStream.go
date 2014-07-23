@@ -3,21 +3,22 @@ package library
 import (
 	"bytes"
 	"encoding/json"
-	"github.com/nytlabs/streamtools/st/blocks" // blocks
+	"errors"
 	"log"
 	"net/http"
 	"strings"
-	"time"
+
+	"github.com/nytlabs/streamtools/st/blocks" // blocks
 )
 
 // specify those channels we're going to use to communicate with streamtools
 type FromHTTPStream struct {
 	blocks.Block
-	queryrule chan chan interface{}
-	inrule    chan interface{}
-	in        chan interface{}
-	out       chan interface{}
-	quit      chan interface{}
+	queryrule chan blocks.MsgChan
+	inrule    blocks.MsgChan
+	in        blocks.MsgChan
+	out       blocks.MsgChan
+	quit      blocks.MsgChan
 }
 
 // a bit of boilerplate for streamtools
@@ -26,11 +27,91 @@ func NewFromHTTPStream() blocks.BlockInterface {
 }
 
 func (b *FromHTTPStream) Setup() {
-	b.Kind = "FromHTTPStream"
+	b.Kind = "Network I/O"
+	b.Desc = "emits new data appearing on a long-lived http stream as new messages in streamtools"
 	b.inrule = b.InRoute("rule")
 	b.queryrule = b.QueryRoute("rule")
 	b.quit = b.Quit()
 	b.out = b.Broadcast()
+}
+
+func listen(b *FromHTTPStream, endpoint string, auth string, dataChan chan interface{}, quitChan chan bool) {
+	transport := http.Transport{
+		Dial: dialTimeout,
+	}
+
+	client := &http.Client{
+		Transport: &transport,
+	}
+	var res *http.Response
+	var body bytes.Buffer
+	// these are the possible delimiters
+	d1 := []byte{125, 10} // this is }\n
+	d2 := []byte{13, 10}  // this is CRLF
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		b.Error(err)
+		return
+	}
+	if len(auth) > 0 {
+		req.SetBasicAuth(strings.Split(auth, ":")[0], strings.Split(auth, ":")[1])
+	}
+	log.Print("getting new response")
+	res, err = client.Do(req)
+	if err != nil {
+		b.Error(err)
+		return
+	}
+	defer res.Body.Close()
+	for {
+		select {
+		case <-quitChan:
+			res.Body.Close()
+			return
+		default:
+			buffer := make([]byte, 5*1024)
+			p, err := res.Body.Read(buffer)
+
+			if err != nil && err.Error() == "EOF" {
+				log.Println("End of stream reached!")
+				res = nil
+				continue
+			}
+
+			if err != nil {
+				b.Error(err)
+				continue
+			}
+			// catch odd little buffers
+			if p < 2 {
+				break
+			}
+			body.Write(buffer[:p])
+			if bytes.Equal(d1, buffer[p-2:p]) || bytes.Equal(d2, buffer[p-2:p]) { // ended with }\n
+				for _, blob := range bytes.Split(body.Bytes(), []byte{10}) { // split on new line in case there are multuple messages per buffer
+					if len(blob) > 0 {
+						var outMsg interface{}
+						err := json.Unmarshal(blob, &outMsg)
+						// if the json parsing fails, store data unparsed as "data"
+						if err != nil {
+							outMsg = map[string]interface{}{
+								"data": blob,
+							}
+						}
+						select {
+						case dataChan <- outMsg:
+						default:
+							b.Error(errors.New("Discarding " + string(len(dataChan)) + "messages"))
+							continue
+						}
+					}
+				}
+				body.Reset()
+			} else { // ended with CRLF which we don't care about
+				body.Reset()
+			}
+		}
+	}
 }
 
 // creates a persistent HTTP connection, emitting all messages from
@@ -39,17 +120,18 @@ func (b *FromHTTPStream) Run() {
 	var endpoint string
 	var ok bool
 	var auth string
-	var body bytes.Buffer
-	// these are the possible delimiters
-	d1 := []byte{125, 10} // this is }\n
-	d2 := []byte{13, 10}  // this is CRLF
-
-	client := &http.Client{}
-	var res *http.Response
+	// channels for the listener
+	dataChan := make(chan interface{}, 1000)
+	var quitChan chan bool
 
 	for {
 		select {
 		case ruleI := <-b.inrule:
+
+			if quitChan != nil {
+				quitChan <- true
+			}
+
 			rule := ruleI.(map[string]interface{})
 			endpoint, ok = rule["Endpoint"].(string)
 			if !ok {
@@ -66,19 +148,8 @@ func (b *FromHTTPStream) Run() {
 				break
 			}
 
-			req, err := http.NewRequest("GET", endpoint, nil)
-
-			if err != nil {
-				log.Fatal(err)
-			}
-			if len(auth) > 0 {
-				req.SetBasicAuth(strings.Split(auth, ":")[0], strings.Split(auth, ":")[1])
-			}
-			res, err = client.Do(req)
-			if err != nil {
-				log.Fatal(err)
-			}
-			defer res.Body.Close()
+			quitChan = make(chan bool)
+			go listen(b, endpoint, auth, dataChan, quitChan)
 
 		case c := <-b.queryrule:
 			c <- map[string]interface{}{
@@ -86,47 +157,12 @@ func (b *FromHTTPStream) Run() {
 				"Auth":     auth,
 			}
 		case <-b.quit:
-			// quit the block
+			if quitChan != nil {
+				quitChan <- true
+			}
 			return
-
-		default:
-			if res == nil {
-				time.Sleep(500 * time.Millisecond)
-				break
-			}
-			buffer := make([]byte, 5*1024)
-			p, err := res.Body.Read(buffer)
-
-			if err != nil && err.Error() == "EOF" {
-				log.Println("End of stream reached!")
-				res = nil
-				continue
-			}
-
-			if err != nil {
-				log.Fatal(err.Error())
-			}
-			// catch odd little buffers
-			if p < 2 {
-				break
-			}
-			body.Write(buffer[:p])
-			if bytes.Equal(d1, buffer[p-2:p]) { // ended with }\n
-				for _, blob := range bytes.Split(body.Bytes(), []byte{10}) { // split on new line in case there are multuple messages per buffer
-					if len(blob) > 0 {
-						var outMsg interface{}
-						err := json.Unmarshal(blob, &outMsg)
-						if err != nil {
-							log.Println("cannot unmarshal json")
-							continue
-						}
-						b.out <- outMsg
-					}
-				}
-				body.Reset()
-			} else if bytes.Equal(d2, buffer[p-2:p]) { // ended with CRLF which we don't care about
-				body.Reset()
-			}
+		case msg := <-dataChan:
+			b.out <- msg
 		}
 	}
 }

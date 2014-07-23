@@ -3,11 +3,12 @@ package server
 import (
 	"errors"
 	"fmt"
+	"github.com/nytlabs/streamtools/st/blocks"
+	"github.com/nytlabs/streamtools/st/library"
 	"net/url"
 	"strconv"
-	"github.com/nytlabs/streamtools/st/library"
-	"github.com/nytlabs/streamtools/st/blocks"
 	"sync"
+	"time"
 )
 
 type BlockInfo struct {
@@ -15,7 +16,7 @@ type BlockInfo struct {
 	Type     string
 	Rule     interface{}
 	Position *Coords
-	chans 	 blocks.BlockChans
+	chans    blocks.BlockChans
 }
 
 type ConnectionInfo struct {
@@ -23,7 +24,7 @@ type ConnectionInfo struct {
 	FromId  string
 	ToId    string
 	ToRoute string
-	chans 	blocks.BlockChans
+	chans   blocks.BlockChans
 }
 
 type Coords struct {
@@ -115,12 +116,14 @@ func (b *BlockManager) Create(blockInfo *BlockInfo) (*BlockInfo, error) {
 	newBlock := library.Blocks[blockInfo.Type]()
 
 	newBlockChans := blocks.BlockChans{
-		InChan: make(chan *blocks.Msg), 
-		QueryChan: make(chan *blocks.QueryMsg),
-		AddChan: make(chan *blocks.AddChanMsg),
-		DelChan: make(chan *blocks.Msg),
-		ErrChan: make(chan error),
-		QuitChan: make(chan bool),
+		InChan:         make(chan *blocks.Msg),
+		QueryChan:      make(chan *blocks.QueryMsg),
+		QueryParamChan: make(chan *blocks.QueryParamMsg),
+		AddChan:        make(chan *blocks.AddChanMsg),
+		DelChan:        make(chan *blocks.Msg),
+		ErrChan:        make(chan error),
+		IdChan:         make(chan string),
+		QuitChan:       make(chan bool),
 	}
 
 	newBlock.SetId(blockInfo.Id)
@@ -143,7 +146,7 @@ func (b *BlockManager) Create(blockInfo *BlockInfo) (*BlockInfo, error) {
 	return blockInfo, nil
 }
 
-func (b *BlockManager) UpdateBlock(id string, coord *Coords) (*BlockInfo, error) {
+func (b *BlockManager) UpdateBlockPosition(id string, coord *Coords) (*BlockInfo, error) {
 	block, ok := b.blockMap[id]
 	if !ok {
 		return nil, errors.New(fmt.Sprintf("Cannot update block %s: does not exist", id))
@@ -161,7 +164,7 @@ func (b *BlockManager) Send(id string, route string, msg interface{}) error {
 	}
 	// send message to block here
 	b.blockMap[id].chans.InChan <- &blocks.Msg{
-		Msg: msg,
+		Msg:   msg,
 		Route: route,
 	}
 
@@ -173,14 +176,40 @@ func (b *BlockManager) QueryBlock(id string, route string) (interface{}, error) 
 	if !ok {
 		return nil, errors.New(fmt.Sprintf("Cannot query block %s: does not exist", id))
 	}
-	returnToSender := make(chan interface{})
+	var returnToSender blocks.MsgChan
+	returnToSender = make(chan interface{})
 	b.blockMap[id].chans.QueryChan <- &blocks.QueryMsg{
-		Route: route,
-		RespChan: returnToSender,
+		Route:   route,
+		MsgChan: returnToSender,
 	}
-	q := <- returnToSender 
+	timeout := time.NewTimer(1 * time.Second)
+	select {
+	case q := <-returnToSender:
+		return q, nil
+	case <-timeout.C:
+		return nil, errors.New(fmt.Sprintf("Cannot query block %s: timeout", id))
+	}
+}
 
-	return q, nil
+func (b *BlockManager) QueryParamBlock(id string, route string, params url.Values) (interface{}, error) {
+	_, ok := b.blockMap[id]
+	if !ok {
+		return nil, errors.New(fmt.Sprintf("Cannot query block %s: does not exist", id))
+	}
+	var returnToSender blocks.MsgChan
+	returnToSender = make(chan interface{})
+	b.blockMap[id].chans.QueryParamChan <- &blocks.QueryParamMsg{
+		Route:    route,
+		RespChan: returnToSender,
+		Params:   params,
+	}
+	timeout := time.NewTimer(1 * time.Second)
+	select {
+	case q := <-returnToSender:
+		return q, nil
+	case <-timeout.C:
+		return nil, errors.New(fmt.Sprintf("Cannot query block %s: timeout", id))
+	}
 }
 
 func (b *BlockManager) QueryConnection(id string, route string) (interface{}, error) {
@@ -189,13 +218,14 @@ func (b *BlockManager) QueryConnection(id string, route string) (interface{}, er
 		return nil, errors.New(fmt.Sprintf("Cannot query block %s: does not exist", id))
 	}
 
-	returnToSender := make(chan interface{})
-	b.connMap[id].chans.QueryChan <- &blocks.QueryMsg{
-		Route: route,
-		RespChan: returnToSender,
+	var returnToSender blocks.MsgChan
+	returnToSender = make(chan interface{})
+	msg := &blocks.QueryMsg{
+		Route:   route,
+		MsgChan: returnToSender,
 	}
-	q := <- returnToSender 
-
+	b.connMap[id].chans.QueryChan <- msg
+	q := <-returnToSender
 
 	return q, nil
 }
@@ -238,12 +268,13 @@ func (b *BlockManager) Connect(connInfo *ConnectionInfo) (*ConnectionInfo, error
 	}
 
 	newConnChans := blocks.BlockChans{
-		InChan: make(chan *blocks.Msg), 
-		QueryChan: make(chan *blocks.QueryMsg),
-		AddChan: make(chan *blocks.AddChanMsg),
-		DelChan: make(chan *blocks.Msg),
-		ErrChan: make(chan error),
-		QuitChan: make(chan bool),
+		InChan:         make(chan *blocks.Msg),
+		QueryChan:      make(chan *blocks.QueryMsg),
+		QueryParamChan: make(chan *blocks.QueryParamMsg),
+		AddChan:        make(chan *blocks.AddChanMsg),
+		DelChan:        make(chan *blocks.Msg),
+		ErrChan:        make(chan error),
+		QuitChan:       make(chan bool),
 	}
 
 	newConn.SetId(connInfo.Id)
@@ -255,33 +286,40 @@ func (b *BlockManager) Connect(connInfo *ConnectionInfo) (*ConnectionInfo, error
 
 	// ask to connect the blocks together
 	b.blockMap[connInfo.FromId].chans.AddChan <- &blocks.AddChanMsg{
-		Route: connInfo.Id,
+		Route:   connInfo.Id,
 		Channel: connInfo.chans.InChan,
 	}
 
 	b.connMap[connInfo.Id].chans.AddChan <- &blocks.AddChanMsg{
-		Route: connInfo.ToId,
+		Route:   connInfo.ToId,
 		Channel: b.blockMap[connInfo.ToId].chans.InChan,
 	}
 
 	return connInfo, nil
 }
 
-func (b *BlockManager) GetSocket(fromId string) (chan *blocks.Msg, string) {
+func (b *BlockManager) GetSocket(fromId string) (chan *blocks.Msg, string, error) {
+	_, ok := b.blockMap[fromId]
+	if !ok {
+		return nil, "", errors.New(fmt.Sprintf("Cannot recieve from block %s: does not exist", fromId))
+	}
+
 	wsChan := make(chan *blocks.Msg)
 	id := b.GetId()
 
 	b.blockMap[fromId].chans.AddChan <- &blocks.AddChanMsg{
-		Route: id,
+		Route:   id,
 		Channel: wsChan,
 	}
 
-	return wsChan, id
+	return wsChan, id, nil
 }
 
 func (b *BlockManager) DeleteSocket(blockId string, connId string) error {
-	b.blockMap[blockId].chans.DelChan <- &blocks.Msg{
-		Route: connId,
+	if _, ok := b.blockMap[blockId]; ok {
+		b.blockMap[blockId].chans.DelChan <- &blocks.Msg{
+			Route: connId,
+		}
 	}
 	return nil
 }
@@ -379,6 +417,79 @@ func (b *BlockManager) DeleteConnection(id string) (string, error) {
 	delete(b.connMap, id)
 
 	return id, nil
+}
+
+func (b *BlockManager) StatusBlocks() []string {
+	var wg sync.WaitGroup
+	MsgChan := make(chan string, len(b.blockMap))
+	for k, _ := range b.blockMap {
+		wg.Add(1)
+		go func(queryChan chan *blocks.QueryMsg) {
+			defer wg.Done()
+			timeout := time.NewTimer(time.Second * 5)
+			var returnToSender blocks.MsgChan
+			returnToSender = make(chan interface{})
+			queryChan <- &blocks.QueryMsg{
+				Route:   "ping",
+				MsgChan: returnToSender,
+			}
+			select {
+			case q := <-returnToSender:
+				MsgChan <- q.(string)
+			case <-timeout.C:
+				MsgChan <- "TIMEOUT"
+			}
+		}(b.blockMap[k].chans.QueryChan)
+	}
+	wg.Wait()
+	responses := make([]string, len(b.blockMap))
+	for i := 0; i < len(b.blockMap); i++ {
+		responses[i] = <-MsgChan
+	}
+	return responses
+}
+
+func (b *BlockManager) UpdateBlockId(fromId string, toId string) (*BlockInfo, []*ConnectionInfo, error) {
+	_, ok := b.blockMap[fromId]
+	if !ok {
+		return nil, nil, errors.New("from block Id does not exist")
+	}
+
+	if !b.IdSafe(toId) {
+		return nil, nil, errors.New(fmt.Sprintf("Cannot create block %s: invalid id", toId))
+	}
+
+	// make sure ID doesn't already exist
+	if b.IdExists(toId) {
+		return nil, nil, errors.New(fmt.Sprintf("Cannot create block %s: id already exists", toId))
+	}
+
+	select {
+	case b.blockMap[fromId].chans.IdChan <- toId:
+	default:
+		return nil, nil, errors.New(fmt.Sprintf("Could not set Id for block %s: timeout", fromId))
+	}
+
+	b.blockMap[toId] = b.blockMap[fromId]
+	b.blockMap[toId].Id = toId
+
+	delete(b.blockMap, fromId)
+
+	var updatedConns []*ConnectionInfo
+
+	for _, c := range b.connMap {
+		if c.FromId == fromId || c.ToId == fromId {
+			updatedConns = append(updatedConns, c)
+			if c.FromId == fromId {
+				c.FromId = toId
+			}
+			if c.ToId == fromId {
+				c.ToId = toId
+			}
+		}
+	}
+
+	return b.blockMap[toId], updatedConns, nil
 }
 
 func (b *BlockManager) ListBlocks() []*BlockInfo {

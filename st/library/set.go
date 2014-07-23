@@ -1,6 +1,8 @@
 package library
 
 import (
+	"errors"
+
 	"github.com/nytlabs/gojee"                 // jee
 	"github.com/nytlabs/streamtools/st/blocks" // blocks
 	"github.com/nytlabs/streamtools/st/util"   // util
@@ -9,13 +11,13 @@ import (
 // specify those channels we're going to use to communicate with streamtools
 type Set struct {
 	blocks.Block
-	queryrule   chan chan interface{}
-	inrule      chan interface{}
-	add         chan interface{}
-	isMember    chan interface{}
-	cardinality chan chan interface{}
-	out         chan interface{}
-	quit        chan interface{}
+	queryrule   chan blocks.MsgChan
+	inrule      blocks.MsgChan
+	add         blocks.MsgChan
+	isMember    blocks.MsgChan
+	cardinality chan blocks.MsgChan
+	out         blocks.MsgChan
+	quit        blocks.MsgChan
 }
 
 // we need to build a simple factory so that streamtools can make new blocks of this kind
@@ -25,7 +27,8 @@ func NewSet() blocks.BlockInterface {
 
 // Setup is called once before running the block. We build up the channels and specify what kind of block this is.
 func (b *Set) Setup() {
-	b.Kind = "Set"
+	b.Kind = "Core"
+	b.Desc = "add, ismember and cardinality routes on a stored set of values"
 
 	// set operations
 	b.add = b.InRoute("add")
@@ -65,6 +68,10 @@ func (b *Set) Run() {
 			if err != nil {
 				b.Error(err)
 				break
+			}
+			if _, ok := v.(string); !ok {
+				b.Error(errors.New("can only build sets of strings"))
+				continue
 			}
 			set[v] = true
 			// deal with inbound data

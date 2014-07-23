@@ -1,23 +1,38 @@
 $(function() {
 
+    // tutorial test
+    function queryParams() {
+        var result = {}, keyValuePairs = location.search.slice(1).split('&');
+
+        keyValuePairs.forEach(function(keyValuePair) {
+            keyValuePair = keyValuePair.split('=');
+            result[keyValuePair[0]] = keyValuePair[1] || '';
+        });
+        return result;
+    }
+
+    // grab the query string params
+    params = queryParams();
+
+    yepnope({
+        test: params["tutorial"] == "gov" ||
+            params["tutorial"] == "citibike",
+
+        yep: [
+            'static/lib/hopscotch.js',
+            'static/css/hopscotch.min.css',
+            'static/css/tutorial.css',
+            'static/js/' + params["tutorial"] + '.js'
+        ],
+    });
+
+
     // before anything, we need to load the library.
     var library = JSON.parse($.ajax({
         url: '/library',
         type: 'GET',
         async: false // required before UI stream starts
     }).responseText);
-
-    var domain = JSON.parse($.ajax({
-        url: '/domain',
-        type: 'GET',
-        async: false // required before UI stream starts
-    }).responseText).Domain;
-
-    var port = JSON.parse($.ajax({
-        url: '/port',
-        type: 'GET',
-        async: false // required before UI stream starts
-    }).responseText).Port;
 
     var version = JSON.parse($.ajax({
         url: '/version',
@@ -28,6 +43,7 @@ $(function() {
     // constants
     var DELETE = 8,
         BACKSPACE = 46,
+        QUESTION_MARK = 191,
         ROUTE = 10,
         HALF_ROUTE = ROUTE * 0.5,
         ROUTE_SPACE = ROUTE * 1.5,
@@ -68,6 +84,86 @@ $(function() {
     $('#create-input').typeahead(null, {
         displayKey: 'key',
         source: libraryHound.ttAdapter()
+    });
+
+    // Shows and hides the reference panel
+    $('#ui-ref-control').click(function() {
+        $('#ui-ref-contents').fadeToggle();
+        resizeReference();
+    });
+
+    // Click-to-add blocks from reference panel
+    $("body").on("click", "#ui-ref-blockdefs .ref-add-block", function() {
+        var blockType = $(this).attr('data-block-type');
+        $.ajax({
+            url: '/blocks',
+            type: 'POST',
+            data: JSON.stringify({
+                'Type': blockType,
+                'Position': {
+                    'X': $(window).width() / 2,
+                    'Y': $(window).height() / 2
+                }
+            }),
+            success: function(result) {}
+        });
+    });
+
+    // Displays exported pattern in a copy-able window pane
+    $("body").on("click", "#ui-ref-export", function(e) {
+        e.preventDefault;
+        $.getJSON('/export', function(pattern) {
+            createStaticPanel('export', JSON.stringify(pattern));
+        });
+    });
+
+    // Displays a panel with textarea you can paste a pattern into
+    $("body").on("click", "#ui-ref-import", function(e) {
+        e.preventDefault;
+        createImportPanel('enter a pattern', '');
+    });
+
+    // Import the pattern into streamtools
+    $("body").on("click", ".import", function(e) {
+        e.preventDefault;
+        pattern = $(this).parent().find(".import-pattern").val();
+        $.ajax({
+            url: '/import',
+            type: 'POST',
+            data: pattern,
+            success: function(result) {
+                $(this).parent().parent().remove();
+            }
+        });
+    });
+
+    // "Are you sure?" you want to clear streamtools yes/no
+    $("body").on("click", "#ui-ref-clear", function(e) {
+        e.preventDefault;
+        $(this).parent().append("<div class='confirm'>Are you sure?<br><span class='confirm-yes'>yes</span> <span class='confirm-no'>no</span></div>");
+    });
+
+    // clears streamtools upon confirmation
+    $("body").on("click", ".confirm-yes", function(e) {
+        e.preventDefault;
+        $.ajax({
+            url: '/clear',
+            type: 'GET',
+            success: function(result) {
+                $("div.confirm").remove();
+            }
+        });
+    });
+    $("body").on("click", ".confirm-no", function(e) {
+        e.preventDefault;
+        $("div.confirm").remove();
+    });
+
+    $(window).on("click", function() {
+        if ($('.intro-text').length > 0) {
+            d3.selectAll('.intro-text')
+                .attr('class', 'intro-text clicked');
+        }
     });
 
     //
@@ -179,18 +275,6 @@ $(function() {
             }
         });
 
-
-    var resize = d3.behavior.drag()
-        .on('dragstart', function(d, i) {
-            d3.event.sourceEvent.stopPropagation();
-            d3.event.sourceEvent.preventDefault();
-        })
-        .on('drag', function(d, i) {
-            var controller = $('[data-id=_' + d.Id + ']');
-            controller.width(controller.width() + d3.event.dx);
-            controller.height(controller.height() + d3.event.dy);
-        });
-
     // ui element for new connection
     var newConnection = svg.select('.linkcontainer').append('path')
         .attr('id', 'newLink')
@@ -235,6 +319,12 @@ $(function() {
             return;
         }
 
+        // if key is question mark ?
+        if (e.keyCode == QUESTION_MARK) {
+            e.preventDefault();
+            $("#ui-ref-contents").fadeToggle();
+        }
+
         // if key is backspace or delete
         if (e.keyCode == DELETE || e.keyCode == BACKSPACE) {
             e.preventDefault();
@@ -269,7 +359,11 @@ $(function() {
             .attr('height', window.innerHeight);
         bg.attr('width', window.innerWidth)
             .attr('height', window.innerHeight);
+        d3.select('intro-text').attr('x', window.innerWidth / 2)
+            .attr('y', window.innerHeight / 2);
     });
+
+    $(window).resize(resizeReference);
 
     $('#create-input').focusout(function() {
         $('#create-input').typeahead('val', '');
@@ -288,6 +382,8 @@ $(function() {
         }
     });
 
+    $("#ui-ref-contents").on("click", ".quick-add", function() {});
+
     $('#log').click(function() {
         if ($(this).hasClass('log-max')) {
             $(this).removeClass('log-max');
@@ -297,6 +393,28 @@ $(function() {
             $(this).addClass('log-max');
         }
     });
+
+    setIntroText();
+
+    function setIntroText() {
+        var numBlocks = (JSON.parse($.ajax({
+            url: '/status',
+            type: 'GET',
+            async: false // required before UI stream starts
+        }).responseText));
+
+        if (numBlocks["Blocks"].length == 0) {
+            var introText = svg.append('text')
+                .attr('x', width / 2)
+                .attr('y', height / 2)
+                .text('Double-click to create a block, or click the ☰ icon to see all blocks.')
+                .attr('class', 'intro-text');
+        }
+
+        $(".intro-text").on('transitionend webkitTransitionEnd oTransitionEnd otransitionend MSTransitionEnd', function() {
+            $(".intro-text").remove();
+        });
+    }
 
     function createStaticPanel(titleTxt, data) {
         var info = d3.select('body').append('div')
@@ -328,6 +446,40 @@ $(function() {
             .text(data);
     }
 
+    function createImportPanel(titleTxt, data) {
+        var info = d3.select('body').append('div')
+            .classed('info-panel', true)
+            .style('top', mouse.y + 'px')
+            .style('left', mouse.x + 'px')
+            .style('display', 'block')
+
+        var title = info.append('div')
+            .classed('title', true)
+            .call(dragTitle);
+
+        title.append('div')
+            .classed('name', true)
+            .text(titleTxt);
+
+        title.append('div')
+            .classed('close', true)
+            .html('&#215;')
+            .on('click', function(d) {
+                $(this).parent().parent().remove();
+            });
+
+        body = info.append('div')
+            .classed('body', true);
+
+        body.append('textarea')
+            .classed('info-text', true)
+            .classed('import-pattern', true)
+            .text(data);
+
+        body.append('div')
+            .classed('import', true)
+            .text('import');
+    }
 
     function pauseEvent(e) {
         if (e.stopPropagation) e.stopPropagation();
@@ -408,9 +560,15 @@ $(function() {
         update();
     }
 
+    // http://stackoverflow.com/questions/10406930/how-to-construct-a-websocket-uri-relative-to-the-page-uri
+    function url(s) {
+        var l = window.location;
+        return ((l.protocol === "https:") ? "wss://" : "ws://") + l.hostname + (((l.port != 80) && (l.port != 443)) ? ":" + l.port : "") + l.pathname + s;
+    }
+
     function logReader() {
         var logTemplate = $('#log-item-template').html();
-        this.ws = new WebSocket('ws://' + domain + ':' + port + '/log');
+        this.ws = new WebSocket(url('log'));
 
         this.ws.onmessage = function(d) {
             var logData = JSON.parse(d.data);
@@ -443,7 +601,7 @@ $(function() {
     function uiReader() {
         _this = this;
         _this.handleMsg = null;
-        this.ws = new WebSocket('ws://' + domain + ':' + port + '/ui');
+        this.ws = new WebSocket(url('ui'));
         this.ws.onopen = function(d) {
             var logTemplate = $('#ui-log-item-template').html();
             var tmpl = _.template(logTemplate, {
@@ -457,6 +615,22 @@ $(function() {
                     "action": "export"
                 }));
             }, 1000);
+
+            var blocks = [];
+            d3.entries(library).forEach(function(key, value) {
+                blocks.push({
+                    type: key.key,
+                    category: key.value.Type,
+                    desc: key.value.Desc
+                })
+            });
+            var refTemplate = $('#ui-ref-item-template').html();
+            window.blocks = blocks;
+
+            var refTmpl = _.template(refTemplate, {
+                data: blocks
+            });
+            $("#ui-ref-contents").html(refTmpl);
         };
         this.ws.onclose = uiReconnect;
         this.ws.onmessage = function(d) {
@@ -561,6 +735,11 @@ $(function() {
         };
     }
 
+    function resizeReference() {
+        // Account for 1) height of log, 2) padding of ref contents, and 3) height of toggle
+        $('#ui-ref-contents').css('max-height', window.innerHeight - $("#log").height() - parseInt($("#ui-ref-contents").css('padding'), 10) - $("#ui-ref-toggle").height());
+    }
+
     function update() {
         control = control.data(blocks, function(d) {
             return d.Id;
@@ -580,7 +759,42 @@ $(function() {
             .classed('name', true)
             .html(function(d) {
                 return d.Id + ' (' + d.Type + ')';
-            });
+            })
+            .on('dblclick', function(d) {
+                var _this = this;
+
+                d3.select(_this.parentNode).on('mousedown.drag', null)
+
+                var input = d3.select(this)
+                    .html('')
+                    .append('input')
+                    .classed('rename-input', true)
+                    .attr('value', d.Id)
+                    .on('keyup', function() {
+                        var newId = $(this).val();
+                        if (d3.event.keyCode == 13 && newId != d.Id) {
+                            $.ajax({
+                                url: '/blocks/' + d.Id,
+                                type: 'PUT',
+                                data: JSON.stringify({
+                                    "Id": newId
+                                }),
+                                success: function(result) {}
+                            });
+                        } else if (d3.event.keyCode == 13 && newId == d.Id) {
+                            $(this).blur();
+                        }
+                    })
+                    .on('blur', function() {
+                        d3.select(_this)
+                            .html(function(d) {
+                                return d.Id + ' (' + d.Type + ')';
+                            })
+                        d3.select(_this.parentNode).call(dragTitle);
+                    })
+
+                input.node().focus();
+            })
 
         titles.append('div')
             .classed('close', true)
@@ -619,6 +833,9 @@ $(function() {
                     var val = ruleInput.val();
                     var type = ruleInput.attr("data-type");
                     switch (type) {
+                        case 'script':
+                            rule[key] = val;
+                            break;
                         case 'boolean':
                             rule[key] = val === 'true' ? true : false;
                             break;
@@ -640,10 +857,6 @@ $(function() {
                     success: function(result) {}
                 });
             });
-
-        bottoms.append('div')
-            .classed('handle', true)
-            .call(resize);
 
         controls.each(function(d) {
             this.refresh = d3.select(this).select('.body')[0][0].refresh;
@@ -1038,4 +1251,5 @@ $(function() {
         isConnecting = false;
         newConn = {};
     }
+
 });

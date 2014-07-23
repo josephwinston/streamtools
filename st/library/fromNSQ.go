@@ -2,18 +2,21 @@ package library
 
 import (
 	"encoding/json"
+
 	"github.com/bitly/go-nsq"
 	"github.com/nytlabs/streamtools/st/blocks"
 	"github.com/nytlabs/streamtools/st/util"
 )
 
+// TODO update NSQ https://github.com/bitly/go-nsq/pull/30
+
 // specify those channels we're going to use to communicate with streamtools
 type FromNSQ struct {
 	blocks.Block
-	queryrule chan chan interface{}
-	inrule    chan interface{}
-	out       chan interface{}
-	quit      chan interface{}
+	queryrule chan blocks.MsgChan
+	inrule    blocks.MsgChan
+	out       blocks.MsgChan
+	quit      blocks.MsgChan
 }
 
 // a bit of boilerplate for streamtools
@@ -22,7 +25,8 @@ func NewFromNSQ() blocks.BlockInterface {
 }
 
 func (b *FromNSQ) Setup() {
-	b.Kind = "FromNSQ"
+	b.Kind = "Queues"
+	b.Desc = "reads from a topic in NSQ as specified in this block's rule"
 	b.inrule = b.InRoute("rule")
 	b.queryrule = b.QueryRoute("rule")
 	b.quit = b.Quit()
@@ -30,7 +34,7 @@ func (b *FromNSQ) Setup() {
 }
 
 type readWriteHandler struct {
-	toOut   chan interface{}
+	toOut   blocks.MsgChan
 	toError chan error
 }
 
@@ -38,8 +42,9 @@ func (self readWriteHandler) HandleMessage(message *nsq.Message) error {
 	var msg interface{}
 	err := json.Unmarshal(message.Body, &msg)
 	if err != nil {
-		self.toError <- err
-		return err
+		msg = map[string]interface{}{
+			"data": message.Body,
+		}
 	}
 	self.toOut <- msg
 	return nil
@@ -47,12 +52,14 @@ func (self readWriteHandler) HandleMessage(message *nsq.Message) error {
 
 // connects to an NSQ topic and emits each message into streamtools.
 func (b *FromNSQ) Run() {
-	var reader *nsq.Reader
+	var reader *nsq.Consumer
 	var topic, channel, lookupdAddr string
 	var maxInFlight float64
 	var err error
-	toOut := make(chan interface{})
+	toOut := make(blocks.MsgChan)
 	toError := make(chan error)
+
+	conf := nsq.NewConfig()
 
 	for {
 		select {
@@ -91,17 +98,17 @@ func (b *FromNSQ) Run() {
 				reader.Stop()
 			}
 
-			reader, err = nsq.NewReader(topic, channel)
+			conf.Set("maxInFlight", maxInFlight)
+			reader, err = nsq.NewConsumer(topic, channel, conf)
 			if err != nil {
 				b.Error(err)
 				continue
 			}
-			reader.SetMaxInFlight(int(maxInFlight))
 
 			h := readWriteHandler{toOut, toError}
 			reader.AddHandler(h)
 
-			err = reader.ConnectToLookupd(lookupdAddr)
+			err = reader.ConnectToNSQLookupd(lookupdAddr)
 			if err != nil {
 				b.Error(err)
 				continue

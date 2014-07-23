@@ -3,22 +3,24 @@ package library
 import (
 	"container/heap"
 	"errors"
+	"strconv"
+	"time"
+
 	"github.com/nytlabs/gojee"                 // jee
 	"github.com/nytlabs/streamtools/st/blocks" // blocks
 	"github.com/nytlabs/streamtools/st/util"   // util
-	"time"
 )
 
 // specify those channels we're going to use to communicate with streamtools
 type Histogram struct {
 	blocks.Block
-	queryrule chan chan interface{}
-	historule chan chan interface{}
-	inrule    chan interface{}
-	inpoll    chan interface{}
-	in        chan interface{}
-	out       chan interface{}
-	quit      chan interface{}
+	queryrule chan blocks.MsgChan
+	historule chan blocks.MsgChan
+	inrule    blocks.MsgChan
+	inpoll    blocks.MsgChan
+	in        blocks.MsgChan
+	out       blocks.MsgChan
+	quit      blocks.MsgChan
 }
 
 // we need to build a simple factory so that streamtools can make new blocks of this kind
@@ -35,7 +37,7 @@ func buildHistogram(histogram map[string]*PriorityQueue) interface{} {
 	for k, pq := range histogram {
 		var bucket interface{}
 		bucket = map[string]interface{}{
-			"Count": len(*pq),
+			"Count": float64(len(*pq)),
 			"Label": k,
 		}
 		buckets[i] = bucket
@@ -50,7 +52,8 @@ func buildHistogram(histogram map[string]*PriorityQueue) interface{} {
 
 // Setup is called once before running the block. We build up the channels and specify what kind of block this is.
 func (b *Histogram) Setup() {
-	b.Kind = "Histogram"
+	b.Kind = "Stats"
+	b.Desc = "builds a non-stationary histogram of inbound messages for a specified path"
 	b.in = b.InRoute("in")
 	b.inrule = b.InRoute("rule")
 	b.queryrule = b.QueryRoute("rule")
@@ -69,6 +72,7 @@ func (b *Histogram) Run() {
 
 	histogram := map[string]*PriorityQueue{}
 	emptyByte := make([]byte, 0)
+MainLoop:
 	for {
 		select {
 		case ruleI := <-b.inrule:
@@ -100,10 +104,21 @@ func (b *Histogram) Run() {
 				b.Error(err)
 				break
 			}
-			valueString, ok := v.(string)
-			if !ok {
-				b.Error(errors.New("nil value against" + path + " - ignoring"))
-				break
+
+			var valueString string
+
+			switch v := v.(type) {
+			default:
+				b.Error(errors.New("unexpected value type"))
+				continue MainLoop
+			case string:
+				valueString = v
+			case int:
+				valueString = strconv.Itoa(v)
+			case bool:
+				valueString = strconv.FormatBool(v)
+			case float64:
+				valueString = strconv.FormatFloat(v, 'g', -1, 64)
 			}
 
 			if pq, ok := histogram[valueString]; ok {
@@ -128,16 +143,16 @@ func (b *Histogram) Run() {
 			// deal with a poll request
 			data := buildHistogram(histogram)
 			b.out <- data
-		case respChan := <-b.queryrule:
+		case MsgChan := <-b.queryrule:
 			// deal with a query request
 			out := map[string]interface{}{
 				"Window": window.String(),
 				"Path":   path,
 			}
-			respChan <- out
-		case respChan := <-b.historule:
+			MsgChan <- out
+		case MsgChan := <-b.historule:
 			data := buildHistogram(histogram)
-			respChan <- data
+			MsgChan <- data
 		}
 		for _, pq := range histogram {
 			for {

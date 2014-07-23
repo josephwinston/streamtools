@@ -1,3 +1,5 @@
+// +build !arm
+
 package library
 
 import (
@@ -5,35 +7,61 @@ import (
 )
 
 var Blocks = map[string]func() blocks.BlockInterface{
-	"count":           NewCount,
-	"movingaverage":   NewMovingAverage,
-	"ticker":          NewTicker,
-	"fromnsq":         NewFromNSQ,
-	"fromhttpstream":  NewFromHTTPStream,
-	"fromsqs":         NewFromSQS,
-	"frompost":        NewFromPost,
-	"tonsq":           NewToNSQ,
-	"toelasticsearch": NewToElasticsearch,
-	"towebsocket":     NewToWebsocket,
-	"tofile":          NewToFile,
-	"tolog":           NewToLog,
-	"mask":            NewMask,
-	"filter":          NewFilter,
-	"sync":            NewSync,
-	"unpack":          NewUnpack,
-	"pack":            NewPack,
-	"set":             NewSet,
-	"join":            NewJoin,
-	"gethttp":         NewGetHTTP,
-	"gaussian":        NewGaussian,
-	"zipf":            NewZipf,
-	"poisson":         NewPoisson,
-	"map":             NewMap,
-	"histogram":       NewHistogram,
-	"timeseries":      NewTimeseries,
-	"fromwebsocket":   NewFromWebsocket,
-	"tonsqmulti":      NewToNSQMulti,
-	"fromudp":         NewFromUDP,
+	"bang":               NewBang,
+	"cache":              NewCache,
+	"categorical":        NewCategorical,
+	"count":              NewCount,
+	"dedupe":             NewDeDupe,
+	"fft":                NewFFT,
+	"filter":             NewFilter,
+	"fromamqp":           NewFromAMQP,
+	"fromemail":          NewFromEmail,
+	"fromfile":           NewFromFile,
+	"fromHTTPGetRequest": NewFromHTTPGetRequest,
+	"fromhttpstream":     NewFromHTTPStream,
+	"fromnsq":            NewFromNSQ,
+	"frompost":           NewFromPost,
+	"fromsqs":            NewFromSQS,
+	"fromwebsocket":      NewFromWebsocket,
+	"fromudp":            NewFromUDP,
+	"gaussian":           NewGaussian,
+	"gethttp":            NewGetHTTP,
+	"histogram":          NewHistogram,
+	"join":               NewJoin,
+	"kullbackleibler":    NewKullbackLeibler,
+	"learn":              NewLearn,
+	"linearModel":        NewLinearModel,
+	"logisticModel":      NewLogisticModel,
+	"map":                NewMap,
+	"mask":               NewMask,
+	"movingaverage":      NewMovingAverage,
+	"packbycount":        NewPackByCount,
+	"packbyinterval":     NewPackByInterval,
+	"packbyvalue":        NewPackByValue,
+	"parsecsv":           NewParseCSV,
+	"parsexml":           NewParseXML,
+	"poisson":            NewPoisson,
+	"javascript":         NewJavascript,
+	"queue":              NewQueue,
+	"redis":              NewRedis,
+	"set":                NewSet,
+	"sync":               NewSync,
+	"ticker":             NewTicker,
+	"timeseries":         NewTimeseries,
+	"toamqp":             NewToAMQP,
+	"tobeanstalkd":       NewToBeanstalkd,
+	"toelasticsearch":    NewToElasticsearch,
+	"toemail":            NewToEmail,
+	"tofile":             NewToFile,
+	"toggle":             NewToggle,
+	"toHTTPGetRequest":   NewToHTTPGetRequest,
+	"tolog":              NewToLog,
+	"tomongodb":          NewToMongoDB,
+	"tonsq":              NewToNSQ,
+	"tonsqmulti":         NewToNSQMulti,
+	"unpack":             NewUnpack,
+	"webRequest":         NewWebRequest,
+	"zipf":               NewZipf,
 }
 
 var BlockDefs = map[string]*blocks.BlockDef{}
@@ -41,7 +69,7 @@ var BlockDefs = map[string]*blocks.BlockDef{}
 func Start() {
 	for k, newBlock := range Blocks {
 		b := newBlock()
-		b.Build(blocks.BlockChans{nil, nil, nil, nil, nil, nil})
+		b.Build(blocks.BlockChans{nil, nil, nil, nil, nil, nil, nil, nil})
 		b.Setup()
 		BlockDefs[k] = b.GetDef()
 	}

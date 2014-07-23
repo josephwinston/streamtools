@@ -3,19 +3,21 @@ package server
 import (
 	"encoding/json"
 	"fmt"
+	"io/ioutil"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"runtime"
+	"runtime/pprof"
+	"time"
+
 	"github.com/gorilla/mux"
 	"github.com/gorilla/websocket"
 	"github.com/nytlabs/streamtools/st/blocks"
 	"github.com/nytlabs/streamtools/st/library"
 	"github.com/nytlabs/streamtools/st/loghub"
 	"github.com/nytlabs/streamtools/st/util"
-	"io/ioutil"
-	"log"
-	"net/http"
-	"os"
-	"runtime"
-	"runtime/pprof"
-	"time"
 )
 
 var logStream = hub{
@@ -46,15 +48,24 @@ func NewServer() *Server {
 }
 
 var resourceType = map[string]string{
-	"lib": "application/javascript; charset=utf-8",
-	"js":  "application/javascript; charset=utf-8",
-	"css": "text/css; charset=utf-8",
+	"html": "text/html; charset=utf-8",
+	"lib":  "application/javascript; charset=utf-8",
+	"js":   "application/javascript; charset=utf-8",
+	"json": "application/javascript; charset=utf-8",
+	"css":  "text/css; charset=utf-8",
 }
 
 func (s *Server) rootHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	data, _ := Asset("gui/index.html")
 	w.Write(data)
+}
+
+func (s *Server) exampleHandler(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	w.Header().Set("Content-Type", resourceType[vars["type"]])
+	data, _ := Asset("examples/" + vars["file"])
+	s.apiWrap(w, r, 200, data)
 }
 
 func (s *Server) staticHandler(w http.ResponseWriter, r *http.Request) {
@@ -74,16 +85,6 @@ func (s *Server) libraryHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	s.apiWrap(w, r, 200, lib)
-}
-
-func (s *Server) portHandler(w http.ResponseWriter, r *http.Request) {
-	p := []byte(fmt.Sprintf(`{"Port": "%s"}`, s.Port))
-	s.apiWrap(w, r, 200, p)
-}
-
-func (s *Server) domainHandler(w http.ResponseWriter, r *http.Request) {
-	p := []byte(fmt.Sprintf(`{"Domain": "%s"}`, s.Domain))
-	s.apiWrap(w, r, 200, p)
 }
 
 func (s *Server) versionHandler(w http.ResponseWriter, r *http.Request) {
@@ -203,7 +204,7 @@ func (s *Server) websocketHandler(w http.ResponseWriter, r *http.Request) {
 	}*/
 	ws, err := websocket.Upgrade(w, r, nil, 1024, 1024)
 	if _, ok := err.(websocket.HandshakeError); ok {
-		http.Error(w, "Not a websocket handshake", 400)
+		s.apiWrap(w, r, 500, s.response("Not a websocket handshake"))
 		return
 	} else if err != nil {
 		//log.Println(err)
@@ -212,8 +213,13 @@ func (s *Server) websocketHandler(w http.ResponseWriter, r *http.Request) {
 	c := &connection{send: make(chan []byte, 256), ws: ws}
 
 	s.manager.Mu.Lock()
-	blockChan, connId := s.manager.GetSocket(vars["id"])
+	blockChan, connId, err := s.manager.GetSocket(vars["id"])
 	s.manager.Mu.Unlock()
+
+	if err != nil {
+		s.apiWrap(w, r, 500, s.response(err.Error()))
+		return
+	}
 
 	ticker := time.NewTicker((10 * time.Second * 9) / 10)
 	go func(c *connection, bChan chan *blocks.Msg, cId string, bId string) {
@@ -224,15 +230,26 @@ func (s *Server) websocketHandler(w http.ResponseWriter, r *http.Request) {
 			ticker.Stop()
 			c.ws.Close()
 		}()
+
+		// start the writePump
+		go c.writePump()
+
 		for {
 			select {
 			case msg := <-bChan:
-				message, _ := json.Marshal(msg.Msg)
-				if err := c.write(websocket.TextMessage, message); err != nil {
+				message, err := json.Marshal(msg.Msg)
+				if err != nil {
+					s.apiWrap(w, r, 500, s.response("Attempted to send non JSON encoded message on websocket"))
 					return
 				}
-			case <-ticker.C:
-				if err := c.write(websocket.PingMessage, []byte{}); err != nil {
+				select {
+				case c.send <- message:
+				default:
+					loghub.Log <- &loghub.LogMsg{
+						Type: loghub.ERROR,
+						Data: "websocket send is blocked! Exiting.",
+						Id:   s.Id,
+					}
 					return
 				}
 			}
@@ -248,8 +265,14 @@ func (s *Server) streamHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.manager.Mu.Lock()
-	blockChan, connId := s.manager.GetSocket(blockId)
+	blockChan, connId, err := s.manager.GetSocket(blockId)
 	s.manager.Mu.Unlock()
+
+	if err != nil {
+		s.apiWrap(w, r, 500, s.response(err.Error()))
+		return
+	}
+
 	for {
 		msg := <-blockChan
 		message, _ := json.Marshal(msg.Msg)
@@ -346,7 +369,9 @@ func (s *Server) serveUIStream(w http.ResponseWriter, r *http.Request) {
 							v,
 							s.Id,
 						})
-						c.send <- out
+						if err := c.write(websocket.TextMessage, out); err != nil {
+							return
+						}
 					}
 					for _, v := range s.manager.ListConnections() {
 						out, _ := json.Marshal(struct {
@@ -358,7 +383,9 @@ func (s *Server) serveUIStream(w http.ResponseWriter, r *http.Request) {
 							v,
 							s.Id,
 						})
-						c.send <- out
+						if err := c.write(websocket.TextMessage, out); err != nil {
+							return
+						}
 					}
 					s.manager.Mu.Unlock()
 				case "rule":
@@ -382,7 +409,9 @@ func (s *Server) serveUIStream(w http.ResponseWriter, r *http.Request) {
 						b,
 						s.Id,
 					})
-					c.send <- out
+					if err := c.write(websocket.TextMessage, out); err != nil {
+						return
+					}
 				}
 			}
 		}
@@ -390,9 +419,32 @@ func (s *Server) serveUIStream(w http.ResponseWriter, r *http.Request) {
 	c.readPump(recv)
 }
 
-// importHandler accepts a JSON through POST that updats the state of ST
-// It handles naming collisions by modifying the incoming block pattern.
-func (s *Server) importHandler(w http.ResponseWriter, r *http.Request) {
+// Handles OPTIONS requests for cross-domain pattern importing (see streamtools-tutorials)
+func (s *Server) optionsHandler(w http.ResponseWriter, r *http.Request) {
+	s.apiWrap(w, r, 200, s.response("OK"))
+}
+
+func (s *Server) ImportFile(filename string) {
+	b, err := ioutil.ReadFile(filename)
+	if err != nil {
+		loghub.Log <- &loghub.LogMsg{
+			Type: loghub.ERROR,
+			Data: err.Error(),
+			Id:   s.Id,
+		}
+	}
+
+	err = s.importJSON(b)
+	if err != nil {
+		loghub.Log <- &loghub.LogMsg{
+			Type: loghub.ERROR,
+			Data: err.Error(),
+			Id:   s.Id,
+		}
+	}
+}
+
+func (s *Server) importJSON(body []byte) error {
 	s.manager.Mu.Lock()
 	defer s.manager.Mu.Unlock()
 
@@ -400,18 +452,12 @@ func (s *Server) importHandler(w http.ResponseWriter, r *http.Request) {
 		Blocks      []*BlockInfo
 		Connections []*ConnectionInfo
 	}
+
 	corrected := make(map[string]string)
 
-	body, err := ioutil.ReadAll(r.Body)
+	err := json.Unmarshal(body, &export)
 	if err != nil {
-		s.apiWrap(w, r, 500, s.response(err.Error()))
-		return
-	}
-
-	err = json.Unmarshal(body, &export)
-	if err != nil {
-		s.apiWrap(w, r, 500, s.response(err.Error()))
-		return
+		return err
 	}
 
 	for _, block := range export.Blocks {
@@ -432,8 +478,7 @@ func (s *Server) importHandler(w http.ResponseWriter, r *http.Request) {
 		block.Id = corrected[block.Id]
 		eblock, err := s.manager.Create(block)
 		if err != nil {
-			s.apiWrap(w, r, 500, s.response(err.Error()))
-			return
+			return err
 		}
 
 		loghub.UI <- &loghub.LogMsg{
@@ -455,8 +500,7 @@ func (s *Server) importHandler(w http.ResponseWriter, r *http.Request) {
 		conn.ToId = corrected[conn.ToId]
 		econn, err := s.manager.Connect(conn)
 		if err != nil {
-			s.apiWrap(w, r, 500, s.response(err.Error()))
-			return
+			return err
 		}
 
 		loghub.Log <- &loghub.LogMsg{
@@ -476,6 +520,23 @@ func (s *Server) importHandler(w http.ResponseWriter, r *http.Request) {
 		Type: loghub.INFO,
 		Data: "Import OK",
 		Id:   s.Id,
+	}
+	return nil
+}
+
+// importHandler accepts a JSON through POST that updats the state of ST
+// It handles naming collisions by modifying the incoming block pattern.
+func (s *Server) importHandler(w http.ResponseWriter, r *http.Request) {
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		s.apiWrap(w, r, 500, s.response(err.Error()))
+		return
+	}
+
+	err = s.importJSON(body)
+	if err != nil {
+		s.apiWrap(w, r, 500, s.response(err.Error()))
+		return
 	}
 
 	s.apiWrap(w, r, 200, s.response("OK"))
@@ -576,8 +637,10 @@ func (s *Server) updateBlockHandler(w http.ResponseWriter, r *http.Request) {
 	s.manager.Mu.Lock()
 	defer s.manager.Mu.Unlock()
 
-	var coord *Coords
+	var update map[string]interface{}
+
 	vars := mux.Vars(r)
+	blockId := vars["id"]
 
 	body, err := ioutil.ReadAll(r.Body)
 	if err != nil {
@@ -585,35 +648,92 @@ func (s *Server) updateBlockHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err = json.Unmarshal(body, &coord)
+	err = json.Unmarshal(body, &update)
 	if err != nil {
 		s.apiWrap(w, r, 500, s.response(err.Error()))
 		return
 	}
 
-	mblock, err := s.manager.UpdateBlock(vars["id"], coord)
+	if _, ok := update["X"]; ok {
+		c := &Coords{
+			X: update["X"].(float64),
+			Y: update["Y"].(float64),
+		}
 
+		mblock, err := s.manager.UpdateBlockPosition(blockId, c)
+
+		if err != nil {
+			s.apiWrap(w, r, 500, s.response(err.Error()))
+			return
+		}
+
+		loghub.Log <- &loghub.LogMsg{
+			Type: loghub.UPDATE,
+			Data: fmt.Sprintf("Block %s", mblock.Id),
+			Id:   s.Id,
+		}
+
+		loghub.UI <- &loghub.LogMsg{
+			Type: loghub.UPDATE_POSITION,
+			Data: mblock,
+			Id:   s.Id,
+		}
+	}
+
+	if _, ok := update["Id"]; ok {
+		mblock, mconnections, err := s.manager.UpdateBlockId(blockId, update["Id"].(string))
+		if err != nil {
+			s.apiWrap(w, r, 500, s.response(err.Error()))
+			return
+		}
+
+		blockId = mblock.Id
+
+		loghub.UI <- &loghub.LogMsg{
+			Type: loghub.DELETE,
+			Data: struct {
+				Id string
+			}{
+				vars["id"],
+			},
+			Id: s.Id,
+		}
+
+		loghub.UI <- &loghub.LogMsg{
+			Type: loghub.CREATE,
+			Data: mblock,
+			Id:   s.Id,
+		}
+
+		for _, c := range mconnections {
+			loghub.UI <- &loghub.LogMsg{
+				Type: loghub.DELETE,
+				Data: struct {
+					Id string
+				}{
+					c.Id,
+				},
+				Id: s.Id,
+			}
+
+			loghub.UI <- &loghub.LogMsg{
+				Type: loghub.CREATE,
+				Data: c,
+				Id:   s.Id,
+			}
+		}
+	}
+
+	block, err := s.manager.GetBlock(blockId)
 	if err != nil {
 		s.apiWrap(w, r, 500, s.response(err.Error()))
 		return
 	}
 
-	jblock, err := json.Marshal(mblock)
+	jblock, err := json.Marshal(block)
 	if err != nil {
 		s.apiWrap(w, r, 500, s.response(err.Error()))
 		return
-	}
-
-	loghub.Log <- &loghub.LogMsg{
-		Type: loghub.UPDATE,
-		Data: fmt.Sprintf("Block %s", mblock.Id),
-		Id:   s.Id,
-	}
-
-	loghub.UI <- &loghub.LogMsg{
-		Type: loghub.UPDATE_POSITION,
-		Data: mblock,
-		Id:   s.Id,
 	}
 
 	s.apiWrap(w, r, 200, jblock)
@@ -695,8 +815,9 @@ func (s *Server) sendRouteHandler(w http.ResponseWriter, r *http.Request) {
 
 	err = json.Unmarshal(body, &msg)
 	if err != nil {
-		s.apiWrap(w, r, 500, s.response(err.Error()))
-		return
+		msg = map[string]interface{}{
+			"data": string(body),
+		}
 	}
 	err = s.manager.Send(vars["id"], vars["route"], msg)
 
@@ -731,11 +852,27 @@ func (s *Server) queryBlockHandler(w http.ResponseWriter, r *http.Request) {
 	defer s.manager.Mu.Unlock()
 
 	vars := mux.Vars(r)
-
-	msg, err := s.manager.QueryBlock(vars["id"], vars["route"])
+	u, err := url.Parse(r.RequestURI)
 	if err != nil {
 		s.apiWrap(w, r, 500, s.response(err.Error()))
 		return
+	}
+	params := u.Query()
+	var msg interface{}
+	if len(params) > 0 {
+		msg, err = s.manager.QueryParamBlock(vars["id"], vars["route"], params)
+		if err != nil {
+			s.apiWrap(w, r, 500, s.response(err.Error()))
+			return
+		}
+
+	} else {
+
+		msg, err = s.manager.QueryBlock(vars["id"], vars["route"])
+		if err != nil {
+			s.apiWrap(w, r, 500, s.response(err.Error()))
+			return
+		}
 	}
 
 	jmsg, err := json.Marshal(msg)
@@ -763,7 +900,6 @@ func (s *Server) queryBlockHandler(w http.ResponseWriter, r *http.Request) {
 	s.apiWrap(w, r, 200, jmsg)
 }
 
-// queryRouteHandler queries a connection and returns a msg. (bidirectional)
 func (s *Server) queryConnectionHandler(w http.ResponseWriter, r *http.Request) {
 	s.manager.Mu.Lock()
 	defer s.manager.Mu.Unlock()
@@ -872,6 +1008,26 @@ func (s *Server) topHandler(w http.ResponseWriter, r *http.Request) {
 	s.apiWrap(w, r, 200, s.response("OK"))
 }
 
+func (s *Server) statusHandler(w http.ResponseWriter, r *http.Request) {
+
+	s.manager.Mu.Lock()
+	defer s.manager.Mu.Unlock()
+
+	export := struct {
+		Blocks []string
+	}{
+		s.manager.StatusBlocks(),
+	}
+
+	jex, err := json.Marshal(export)
+	if err != nil {
+		s.apiWrap(w, r, 500, s.response(err.Error()))
+		return
+	}
+
+	s.apiWrap(w, r, 200, jex)
+}
+
 func (s *Server) profStartHandler(w http.ResponseWriter, r *http.Request) {
 	f, err := os.Create("streamtools.prof")
 	if err != nil {
@@ -925,6 +1081,8 @@ func (s *Server) response(statusTxt string) []byte {
 func (s *Server) apiWrap(w http.ResponseWriter, r *http.Request, statusCode int, data []byte) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Requested-With")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, POST, DELETE, OPTIONS")
 	w.WriteHeader(statusCode)
 	w.Write(data)
 
@@ -992,30 +1150,35 @@ func (s *Server) Run() {
 	loghub.AddUI <- uiStream.Broadcast
 
 	r := mux.NewRouter()
+	r.StrictSlash(true)
 	r.HandleFunc("/", s.rootHandler)
 	r.HandleFunc("/library", s.libraryHandler)
 	r.HandleFunc("/static/{type}/{file}", s.staticHandler)
 	r.HandleFunc("/log", s.serveLogStream)
 	r.HandleFunc("/ui", s.serveUIStream)
-	r.HandleFunc("/port", s.portHandler)
-	r.HandleFunc("/domain", s.domainHandler)
 	r.HandleFunc("/version", s.versionHandler)
 	r.HandleFunc("/top", s.topHandler)
+	r.HandleFunc("/examples/{file}", s.exampleHandler)
+	r.HandleFunc("/status", s.statusHandler)
 	r.HandleFunc("/profstart", s.profStartHandler)
 	r.HandleFunc("/profstop", s.profStopHandler)
 	r.HandleFunc("/clear", s.clearHandler).Methods("GET")
 	r.HandleFunc("/import", s.importHandler).Methods("POST")
+	r.HandleFunc("/import", s.optionsHandler).Methods("OPTIONS")
 	r.HandleFunc("/export", s.exportHandler).Methods("GET")
 	r.HandleFunc("/blocks", s.listBlockHandler).Methods("GET")                         // list all blocks
 	r.HandleFunc("/blocks", s.createBlockHandler).Methods("POST")                      // create block w/o id
+	r.HandleFunc("/blocks", s.optionsHandler).Methods("OPTIONS")                       // allow cross-domain
 	r.HandleFunc("/blocks/{id}", s.blockInfoHandler).Methods("GET")                    // get block info
 	r.HandleFunc("/blocks/{id}", s.updateBlockHandler).Methods("PUT")                  // update block
 	r.HandleFunc("/blocks/{id}", s.deleteBlockHandler).Methods("DELETE")               // delete block
 	r.HandleFunc("/blocks/{id}/{route}", s.sendRouteHandler).Methods("POST")           // send to block route
 	r.HandleFunc("/blocks/{id}/{route}", s.queryBlockHandler).Methods("GET")           // get from block route
+	r.HandleFunc("/blocks/{id}/{route}", s.optionsHandler).Methods("OPTIONS")          // allow cross-domain
 	r.HandleFunc("/ws/{id}", s.websocketHandler).Methods("GET")                        // websocket handler
 	r.HandleFunc("/stream/{id}", s.streamHandler).Methods("GET")                       // http stream handler
 	r.HandleFunc("/connections", s.createConnectionHandler).Methods("POST")            // create connection
+	r.HandleFunc("/connections", s.optionsHandler).Methods("OPTIONS")                  // allow cross-domain
 	r.HandleFunc("/connections", s.listConnectionHandler).Methods("GET")               // list connections
 	r.HandleFunc("/connections/{id}", s.connectionInfoHandler).Methods("GET")          // get info for connection
 	r.HandleFunc("/connections/{id}", s.deleteConnectionHandler).Methods("DELETE")     // delete connection

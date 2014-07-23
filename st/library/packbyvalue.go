@@ -3,30 +3,32 @@ package library
 import (
 	"container/heap"
 	"errors"
+	"time"
+
 	"github.com/nytlabs/gojee"
 	"github.com/nytlabs/streamtools/st/blocks" // blocks
 	"github.com/nytlabs/streamtools/st/util"
-	"time"
 )
 
 // specify those channels we're going to use to communicate with streamtools
-type Pack struct {
+type PackByValue struct {
 	blocks.Block
-	queryrule chan chan interface{}
-	inrule    chan interface{}
-	in        chan interface{}
-	out       chan interface{}
-	quit      chan interface{}
+	queryrule chan blocks.MsgChan
+	inrule    blocks.MsgChan
+	in        blocks.MsgChan
+	out       blocks.MsgChan
+	quit      blocks.MsgChan
 }
 
 // we need to build a simple factory so that streamtools can make new blocks of this kind
-func NewPack() blocks.BlockInterface {
-	return &Pack{}
+func NewPackByValue() blocks.BlockInterface {
+	return &PackByValue{}
 }
 
 // Setup is called once before running the block. We build up the channels and specify what kind of block this is.
-func (b *Pack) Setup() {
-	b.Kind = "Pack"
+func (b *PackByValue) Setup() {
+	b.Kind = "Core"
+	b.Desc = "groups messages together based on a common value, similar to 'group-by' in other languages"
 	b.in = b.InRoute("in")
 	b.inrule = b.InRoute("rule")
 	b.queryrule = b.QueryRoute("rule")
@@ -35,7 +37,7 @@ func (b *Pack) Setup() {
 }
 
 // Run is the block's main loop. Here we listen on the different channels we set up.
-func (b *Pack) Run() {
+func (b *PackByValue) Run() {
 	var tree *jee.TokenTree
 	var emitAfter, path string
 	var err error
@@ -48,6 +50,7 @@ func (b *Pack) Run() {
 
 	for {
 		select {
+		case <-waitTimer.C:
 		case ruleI := <-b.inrule:
 			// set a parameter of the block
 			rule, ok := ruleI.(map[string]interface{})
@@ -148,7 +151,7 @@ func (b *Pack) Run() {
 				// we've not seen anything since putting this message in the queue
 
 				msg := map[string]interface{}{
-					"pack": bunches[idStr],
+					"Pack": bunches[idStr],
 				}
 
 				b.out <- msg

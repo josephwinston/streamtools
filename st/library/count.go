@@ -2,20 +2,22 @@ package library
 
 import (
 	"container/heap"
+	"time"
+
 	"github.com/nytlabs/streamtools/st/blocks" // blocks
 	"github.com/nytlabs/streamtools/st/util"
-	"time"
 )
 
 type Count struct {
 	blocks.Block
-	queryrule  chan chan interface{}
-	querycount chan chan interface{}
-	inrule     chan interface{}
-	inpoll     chan interface{}
-	in         chan interface{}
-	out        chan interface{}
-	quit       chan interface{}
+	queryrule  chan blocks.MsgChan
+	querycount chan blocks.MsgChan
+	inrule     blocks.MsgChan
+	inpoll     blocks.MsgChan
+	clear      blocks.MsgChan
+	in         blocks.MsgChan
+	out        blocks.MsgChan
+	quit       blocks.MsgChan
 }
 
 // a bit of boilerplate for streamtools
@@ -24,10 +26,12 @@ func NewCount() blocks.BlockInterface {
 }
 
 func (b *Count) Setup() {
-	b.Kind = "Count"
+	b.Kind = "Stats"
+	b.Desc = "counts the number of messages seen over a specified Window"
 	b.in = b.InRoute("in")
 	b.inrule = b.InRoute("rule")
 	b.inpoll = b.InRoute("poll")
+	b.clear = b.InRoute("clear")
 	b.queryrule = b.QueryRoute("rule")
 	b.querycount = b.QueryRoute("count")
 	b.quit = b.Quit()
@@ -67,9 +71,13 @@ func (b *Count) Run() {
 				t:   time.Now(),
 			}
 			heap.Push(pq, queueMessage)
+		case <-b.clear:
+			for len(*pq) > 0 {
+				heap.Pop(pq)
+			}
 		case <-b.inpoll:
 			b.out <- map[string]interface{}{
-				"Count": len(*pq),
+				"Count": float64(len(*pq)),
 			}
 		case c := <-b.queryrule:
 			c <- map[string]interface{}{
@@ -77,7 +85,7 @@ func (b *Count) Run() {
 			}
 		case c := <-b.querycount:
 			c <- map[string]interface{}{
-				"Count": len(*pq),
+				"Count": float64(len(*pq)),
 			}
 		}
 		for {
